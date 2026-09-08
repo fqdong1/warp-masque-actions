@@ -3,5 +3,13 @@ usque
 usque.zip
 mihomo
 mihomo.gz
-dist/
+/dist/
 check/
+opera-proxy
+ruleset/
+node_modules/
+.wrangler/
+worker/package-lock.json
+
+# worker/dist 是网页部署要用的单文件，必须提交
+!worker/dist/

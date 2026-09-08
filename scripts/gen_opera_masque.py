@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""
-注册 Cloudflare WARP (MASQUE) 设备并生成 mihomo 配置。
+"""生成 Opera VPN over Cloudflare WARP(MASQUE) 的 mihomo 配置。
 
-需要先跑 usque register 拿到 config.json，本脚本负责把它转成
-带全部可用 endpoint 的 mihomo yaml。
+链路: 本机 -> MASQUE 接入点 -> Opera 落地 -> 目标
+
+每个 Opera 落地和每个 MASQUE 接入点都组合一遍，任一环失效都有替代路径。
+MASQUE 那一跳把 Opera 的地址完全藏进 QUIC 隧道，本机侧只看得到
+162.159.198.x 这类 Cloudflare 地址。
 
 用法:
-    python3 gen_masque.py <usque-config.json> <输出目录>
+    python3 gen.py <usque-config.json> <opera-proxy 路径> <输出目录>
 """
 import json
 import os
+import re
+import subprocess
 import sys
-import urllib.parse
 
-# 全部经真机握手实测（2026-09-05，psg2）
-# QUIC 回包不等于能建隧道：162.159.194/196/197/204 段与 v6 的 102/105 段
-# 会回包但 login 失败，已剔除。
+# MASQUE 接入点。均经真机握手实测（2026-09-05，psg2）：
+# QUIC 回包不等于能建隧道，162.159.194/196/197/204 与 v6 的 102/105 段
+# 会回包但 login 失败，不要往回加。
 V4 = ["162.159.198.1", "162.159.198.2", "162.159.199.1", "162.159.199.2"]
 V6 = ["2606:4700:103::1", "2606:4700:103::2",
       "2606:4700:104::1", "2606:4700:104::2"]
@@ -25,6 +28,9 @@ PORTS = (443, 500, 1701, 4500, 4443, 8443, 8095)
 # CF 没有 A 记录指向 MASQUE 段，官方域名只能用在 SNI 上
 OFFICIAL_SNI = "zt-masque.cloudflareclient.com"
 SNI_NODE = ("162.159.198.1", 443)
+
+# Opera VPN 只有三个大区，没有国家级选项
+REGIONS = {"AS": "亚洲", "EU": "欧洲", "AM": "美洲"}
 
 RS = "https://raw.githubusercontent.com"
 RULESETS = [
@@ -90,14 +96,21 @@ AI_DOMAINS = [
 
 
 def pem_to_b64der(pem):
-    return "".join(
-        ln.strip() for ln in pem.strip().splitlines()
-        if ln.strip() and not ln.startswith("-----")
-    )
+    return "".join(ln.strip() for ln in pem.strip().splitlines()
+                   if ln.strip() and not ln.startswith("-----"))
 
 
-def node(name, ip, port, priv, pub, v4, v6, sni=None):
-    # 裸 IPv6 含冒号，YAML 里必须加引号否则被解析成映射
+def entry_name(ip, port):
+    """接入点名字，短一些，后面要拼进组合节点名。"""
+    if ":" in ip:
+        seg = ip.split(":")[2]
+        tail = ip.rsplit(":", 1)[-1]
+        return f"v6-{seg}-{tail}-{port}"
+    return f"{'.'.join(ip.split('.')[2:])}-{port}"
+
+
+def masque_node(name, ip, port, priv, pub, v4, v6, sni=None):
+    # 裸 IPv6 含冒号，YAML 里必须加引号否则被当成映射
     srv = f'"{ip}"' if ":" in ip else ip
     extra = f"\n    sni: {sni}" if sni else ""
     return f"""  - name: {name}
@@ -114,62 +127,79 @@ def node(name, ip, port, priv, pub, v4, v6, sni=None):
     dns: [1.1.1.1, 2606:4700:4700::1111]"""
 
 
-def node_name(ip, port):
-    if ":" in ip:
-        seg = ip.split(":")[2]
-        tail = ip.rsplit(":", 1)[-1]
-        return f"WARP6-{seg}-{tail}-{port}"
-    return f"WARP-{'.'.join(ip.split('.')[2:])}-{port}"
+def opera_landings(binary):
+    """跑 opera-proxy 拿匿名凭据和落地服务器清单。"""
+    out = []
+    for code, loc in REGIONS.items():
+        r = subprocess.run([binary, "-country", code, "-list-proxies"],
+                           capture_output=True, text=True, timeout=180)
+        login = re.search(r"Proxy login: (\S+)", r.stdout)
+        pw = re.search(r"Proxy password: (\S+)", r.stdout)
+        if not (login and pw):
+            print(f"警告: {code} 区取凭据失败，跳过", file=sys.stderr)
+            continue
+        seq = 0
+        for line in r.stdout.splitlines():
+            m = re.match(r"^([\w.-]+\.sec-tunnel\.com),([\d.]+),(\d+)$",
+                         line.strip())
+            if not m:
+                continue
+            host, ip, port = m.groups()
+            seq += 1
+            out.append({"loc": loc, "tag": f"{loc}{seq}", "host": host,
+                        "ip": ip, "port": int(port),
+                        "user": login.group(1), "pw": pw.group(1)})
+    return out
 
 
-def masque_links(cfg, priv, pub):
-    """生成 Shadowrocket 用的 masque:// 链接。
-
-    格式参数与字段名对齐 Shadowrocket 的 masque 实现：
-    masque://<endpoint_ip>:<port>?publicKey=&privateKey=&ip=&dns=&udp=&cc=&flag=#<名称>
-    publicKey 用剥掉 PEM 头尾的 base64 DER，privateKey 直接用 usque 的原值。
-    逗号不转义（Shadowrocket 的 dns 字段接受逗号分隔）。
-    """
-    def enc(v):
-        return urllib.parse.quote(str(v), safe="").replace("%2C", ",")
-
-    lines = []
-    for ip in V4 + V6:
-        for port in PORTS:
-            params = "&".join([
-                "publicKey=" + enc(pub),
-                "privateKey=" + enc(priv),
-                "ip=" + enc(cfg["ipv4"]),
-                "dns=" + enc("1.1.1.1, 8.8.8.8"),
-                "udp=1",
-                "cc=" + enc(""),
-                "flag=" + enc("CDN"),
-            ])
-            host = "[%s]" % ip if ":" in ip else ip
-            name = node_name(ip, port)
-            lines.append("masque://%s:%d?%s#%s" % (host, port, params, enc(name)))
-    return lines
-
-
-def build(cfg):
+def build(cfg, landings):
     priv = cfg["private_key"].strip()
     if priv.startswith("-----"):
         priv = pem_to_b64der(priv)
     pub = pem_to_b64der(cfg["endpoint_pub_key"])
     v4, v6 = cfg["ipv4"], cfg["ipv6"]
 
-    names, proxies = [], []
+    # 1. 全部 MASQUE 接入点
+    entries, proxies = [], []
     for ip in V4 + V6:
         for port in PORTS:
-            name = node_name(ip, port)
-            names.append(name)
-            proxies.append(node(name, ip, port, priv, pub, v4, v6))
+            n = entry_name(ip, port)
+            entries.append(n)
+            proxies.append(masque_node(n, ip, port, priv, pub, v4, v6))
+    entries.append("官方域名")
+    proxies.append(masque_node("官方域名", SNI_NODE[0], SNI_NODE[1],
+                               priv, pub, v4, v6, OFFICIAL_SNI))
 
-    names.append("WARP-官方域名")
-    proxies.append(node("WARP-官方域名", SNI_NODE[0], SNI_NODE[1],
-                        priv, pub, v4, v6, OFFICIAL_SNI))
+    # 2. 落地 × 接入点 全组合
+    by_loc = {}
+    for land in landings:
+        for ent in entries:
+            name = f"{land['tag']}@{ent}"
+            by_loc.setdefault(land["loc"], []).append(name)
+            proxies.append(
+                f'  - {{name: "{name}", type: http, server: {land["ip"]}, '
+                f'port: {land["port"]}, username: {land["user"]}, '
+                f'password: {land["pw"]}, tls: true, sni: {land["host"]}, '
+                f'skip-cert-verify: false, dialer-proxy: {ent}}}')
 
-    ind = lambda lst, n=6: "\n".join(" " * n + f"- {x}" for x in lst)
+    combos = sum(len(v) for v in by_loc.values())
+
+    def q(items, n=6):
+        return "\n".join(" " * n + f'- "{x}"' for x in items)
+
+    def plain(items, n=6):
+        return "\n".join(" " * n + f"- {x}" for x in items)
+
+    # 组合数太多，平铺在一个组里没法选，按地区收成 url-test
+    loc_names = [f"{loc}线路" for loc in by_loc]
+    loc_defs = "\n\n".join(f"""  - name: {loc}线路
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 80
+    lazy: true
+    proxies:
+{q(tags)}""" for loc, tags in by_loc.items())
 
     prov, rules = [], []
     for i, (group, url) in enumerate(RULESETS):
@@ -186,14 +216,17 @@ def build(cfg):
     # 内联的 AI 域名放在 RULE-SET 前面，别被上游更宽的条目抢先命中
     rules = [f"  - DOMAIN-SUFFIX,{d},🤖 AI服务" for d in AI_DOMAINS] + rules
 
-    links = masque_links(cfg, priv, pub)
-
-    return links, f"""# Cloudflare WARP over MASQUE - mihomo 配置
+    yaml = f"""# Opera VPN over Cloudflare WARP (MASQUE)
 # 由 GitHub Actions 自动生成，请勿手工编辑
-# 需要 mihomo Alpha 分支：稳定版没有 masque outbound
 #
-# 节点 {len(names)} 个，endpoint 均经真机握手实测。
-# private-key 等同账号凭据。
+# 链路: 本机 -> MASQUE 接入点 -> Opera 落地 -> 目标
+# 节点名 "欧洲1@198.1-443" = 欧洲第 1 个落地，经 162.159.198.1:443 接入。
+#
+# 接入点 {len(entries)} 个 x 落地 {len(landings)} 个 = 组合 {combos} 个。
+# 任一接入点被墙或任一落地失效，其他组合仍可用。
+#
+# 需要 mihomo Alpha 分支：稳定版没有 masque outbound。
+# private-key 等同 WARP 账号凭据，Opera 凭据为匿名注册且会过期。
 
 mixed-port: 7890
 allow-lan: false
@@ -258,30 +291,27 @@ proxy-groups:
     type: select
     proxies:
       - ♻️ 自动选择
+{plain(loc_names)}
       - 🔄 故障转移
-      - ☑️ 手动切换
-      - DIRECT
-
-  - name: ☑️ 手动切换
-    type: select
-    proxies:
-{ind(names)}
 
   - name: ♻️ 自动选择
     type: url-test
     url: http://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
-    lazy: false
+    lazy: true
     proxies:
-{ind(names)}
+{plain(loc_names)}
 
   - name: 🔄 故障转移
     type: fallback
     url: http://www.gstatic.com/generate_204
     interval: 180
+    lazy: true
     proxies:
-{ind(names)}
+{plain(loc_names)}
+
+{loc_defs}
 
   - name: 📹 油管视频
     type: select
@@ -289,8 +319,7 @@ proxy-groups:
       - 🚀 节点选择
       - ♻️ 自动选择
       - 🔄 故障转移
-      - ☑️ 手动切换
-      - DIRECT
+{plain(loc_names)}
 
   - name: 🎥 奈飞视频
     type: select
@@ -298,8 +327,7 @@ proxy-groups:
       - 🚀 节点选择
       - ♻️ 自动选择
       - 🔄 故障转移
-      - ☑️ 手动切换
-      - DIRECT
+{plain(loc_names)}
 
   - name: 🌍 国外媒体
     type: select
@@ -322,8 +350,7 @@ proxy-groups:
       - 🚀 节点选择
       - ♻️ 自动选择
       - 🔄 故障转移
-      - ☑️ 手动切换
-      - DIRECT
+{plain(loc_names)}
 
   - name: Ⓜ️ 微软服务
     type: select
@@ -380,32 +407,36 @@ rules:
   - GEOIP,LAN,🎯 全球直连,no-resolve
   - GEOIP,CN,🎯 全球直连
   - MATCH,🐟 漏网之鱼
-""", len(names)
+"""
+    return yaml, len(entries), len(landings), combos
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("用法: gen_masque.py <usque-config.json> <输出目录>", file=sys.stderr)
+    if len(sys.argv) < 4:
+        print("用法: gen.py <usque-config.json> <opera-proxy> <输出目录>",
+              file=sys.stderr)
         sys.exit(1)
-    src, outdir = sys.argv[1], sys.argv[2]
-    with open(src) as f:
+    cfg_path, opera_bin, outdir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+    with open(cfg_path) as f:
         cfg = json.load(f)
 
-    os.makedirs(outdir, exist_ok=True)
-    links, yaml, count = build(cfg)
+    landings = opera_landings(opera_bin)
+    if not landings:
+        sys.exit("一个 Opera 落地都没取到，可能是源 IP 被限速，换台机器再试")
 
-    path = os.path.join(outdir, "warp-masque.yaml")
+    yaml, n_entry, n_land, n_combo = build(cfg, landings)
+
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, "opera-masque.yaml")
     with open(path, "w") as f:
         f.write(yaml)
 
-    txt = os.path.join(outdir, "warp-masque-shadowrocket.txt")
-    with open(txt, "w") as f:
-        f.write("\n".join(links) + "\n")
-
     print(f"已生成 {path}")
-    print(f"已生成 {txt}（{len(links)} 条 masque:// 链接）")
-    print(f"节点数 {count}")
-    print(f"内网地址 {cfg['ipv4']} / {cfg['ipv6']}")
+    print(f"MASQUE 接入点 {n_entry} 个")
+    print(f"Opera 落地   {n_land} 个: "
+          + ", ".join(sorted({l['tag'] for l in landings})))
+    print(f"组合节点     {n_combo} 个")
 
 
 if __name__ == "__main__":
